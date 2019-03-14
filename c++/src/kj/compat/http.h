@@ -706,6 +706,11 @@ kj::Own<HttpClient> newHttpClient(HttpHeaderTable& responseHeaderTable, kj::Asyn
 // subsequent requests will fail. If a response takes a long time, it blocks subsequent responses.
 // If a WebSocket is opened successfully, all subsequent requests fail.
 
+kj::Own<HttpClient> newConcurrencyLimitingHttpClient(HttpClient& inner,
+                                                     uint maxConcurrentRequests);
+// Creates an HttpClient that is limited to a maximum number of concurrent requests.  Additional
+// requests are queued, to be opened only after an existing request completes.
+
 kj::Own<HttpClient> newHttpClient(HttpService& service);
 kj::Own<HttpService> newHttpService(HttpClient& client);
 // Adapts an HttpClient to an HttpService and vice versa.

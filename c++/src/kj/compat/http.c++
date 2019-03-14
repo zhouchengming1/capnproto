@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <kj/encoding.h>
 #include <deque>
+#include <queue>
 #include <map>
 
 namespace kj {
@@ -3945,6 +3946,149 @@ kj::Own<HttpClient> newHttpClient(kj::Timer& timer, HttpHeaderTable& responseHea
                                   HttpClientSettings settings) {
   return kj::heap<NetworkHttpClient>(
       timer, responseHeaderTable, network, tlsNetwork, kj::mv(settings));
+}
+
+// =======================================================================================
+
+namespace {
+
+class ConcurrencyLimitingHttpClient final: public HttpClient {
+public:
+  ConcurrencyLimitingHttpClient(kj::HttpClient& inner, uint maxConcurrentRequests)
+      : inner(inner),
+        maxConcurrentRequests(maxConcurrentRequests) {}
+
+  Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+                  kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
+    if (concurrentRequests < maxConcurrentRequests) {
+      auto counter = kj::heap<ConnectionCounter>(*this);
+      auto request = inner.request(method, url, headers, expectedBodySize);
+      auto promise = attachCounter(kj::mv(request.response), kj::mv(counter));
+      return { kj::mv(request.body), kj::mv(promise) };
+    }
+
+    auto paf = kj::newPromiseAndFulfiller<kj::Own<ConnectionCounter>>();
+    auto urlCopy = kj::str(url);
+    auto headersCopy = headers.clone();
+    // TODO(now): Use PromiseOutputStream instead
+    auto pipe = newOneWayPipe(expectedBodySize);
+
+    auto promise = paf.promise
+        .then([this,
+               method,
+               urlCopy = kj::mv(urlCopy),
+               headersCopy = kj::mv(headersCopy),
+               expectedBodySize,
+               pipeIn = kj::mv(pipe.in)](kj::Own<ConnectionCounter>&& counter) mutable {
+          auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
+          return pipeIn->pumpTo(*request.body).ignoreResult().attach(kj::mv(request.body))
+              .then([response = kj::mv(request.response),
+                     counter = kj::mv(counter)]() mutable {
+                return attachCounter(kj::mv(response), kj::mv(counter));
+              });
+        });
+
+    pendingRequests.push(kj::mv(paf.fulfiller));
+    return { kj::mv(pipe.out), kj::mv(promise) };
+  }
+
+  kj::Promise<WebSocketResponse> openWebSocket(
+      kj::StringPtr url, const kj::HttpHeaders& headers) override {
+    if (concurrentRequests < maxConcurrentRequests) {
+      auto counter = kj::heap<ConnectionCounter>(*this);
+      return attachCounter(inner.openWebSocket(url, headers), kj::mv(counter));
+    }
+
+    auto paf = kj::newPromiseAndFulfiller<kj::Own<ConnectionCounter>>();
+    auto urlCopy = kj::str(url);
+    auto headersCopy = headers.clone();
+
+    auto promise = paf.promise
+        .then([this,
+               urlCopy = kj::mv(urlCopy),
+               headersCopy = kj::mv(headersCopy)](kj::Own<ConnectionCounter>&& counter) mutable {
+          return attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
+        });
+
+    pendingRequests.push(kj::mv(paf.fulfiller));
+    return kj::mv(promise);
+  }
+
+private:
+  struct ConnectionCounter;
+
+  kj::HttpClient& inner;
+  uint maxConcurrentRequests;
+  uint concurrentRequests = 0;
+
+  std::queue<kj::Own<kj::PromiseFulfiller<kj::Own<ConnectionCounter>>>> pendingRequests;
+  // TODO(someday): want maximum cap on queue size?
+
+  struct ConnectionCounter final {
+    ConnectionCounter(ConcurrencyLimitingHttpClient& parent)
+        : parent(parent) {
+      ++parent.concurrentRequests;
+    }
+    ~ConnectionCounter() noexcept(false) {
+      --parent.concurrentRequests;
+      parent.serviceQueue();
+    }
+    ConcurrencyLimitingHttpClient& parent;
+  };
+
+  void serviceQueue() {
+    if (concurrentRequests >= maxConcurrentRequests) { return; }
+    if (pendingRequests.empty()) { return; }
+
+    auto fulfiller = kj::mv(pendingRequests.front());
+    pendingRequests.pop();
+    fulfiller->fulfill(kj::heap<ConnectionCounter>(*this));
+  }
+
+  using WebSocketOrBody = kj::OneOf<kj::Own<kj::AsyncInputStream>, kj::Own<WebSocket>>;
+  static WebSocketOrBody attachCounter(WebSocketOrBody&& webSocketOrBody,
+                                       kj::Own<ConnectionCounter>&& counter) {
+    KJ_SWITCH_ONEOF(webSocketOrBody) {
+      KJ_CASE_ONEOF(ws, kj::Own<WebSocket>) {
+        return ws.attach(kj::mv(counter));
+      }
+      KJ_CASE_ONEOF(body, kj::Own<kj::AsyncInputStream>) {
+        return body.attach(kj::mv(counter));
+      }
+    }
+    KJ_UNREACHABLE;
+  }
+
+  static kj::Promise<WebSocketResponse> attachCounter(kj::Promise<WebSocketResponse>&& promise,
+                                                      kj::Own<ConnectionCounter>&& counter) {
+    return promise.then([counter = kj::mv(counter)](WebSocketResponse&& response) mutable {
+      return WebSocketResponse {
+        response.statusCode,
+        response.statusText,
+        response.headers,
+        attachCounter(kj::mv(response.webSocketOrBody), kj::mv(counter))
+      };
+    });
+  }
+
+  static kj::Promise<Response> attachCounter(kj::Promise<Response>&& promise,
+                                             kj::Own<ConnectionCounter>&& counter) {
+    return promise.then([counter = kj::mv(counter)](Response&& response) mutable {
+      return Response {
+        response.statusCode,
+        response.statusText,
+        response.headers,
+        response.body.attach(kj::mv(counter))
+      };
+    });
+  }
+};
+
+}
+
+kj::Own<HttpClient> newConcurrencyLimitingHttpClient(HttpClient& inner,
+                                                     uint maxConcurrentRequests) {
+  return kj::heap<ConcurrencyLimitingHttpClient>(inner, maxConcurrentRequests);
 }
 
 // =======================================================================================
