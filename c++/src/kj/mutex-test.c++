@@ -221,5 +221,92 @@ TEST(Mutex, LazyException) {
 #endif
 }
 
+class OnlyTouchUnderLock {
+public:
+  OnlyTouchUnderLock(): ptr(nullptr) {}
+  OnlyTouchUnderLock(MutexGuarded<uint>& ref): ptr(&ref) {
+    ptr->getAlreadyLockedExclusive()++;
+  }
+  OnlyTouchUnderLock(OnlyTouchUnderLock&& other): ptr(other.ptr) {
+    other.ptr = nullptr;
+    if (ptr) {
+      ptr->getAlreadyLockedExclusive()++;
+    }
+  }
+  OnlyTouchUnderLock& operator=(OnlyTouchUnderLock&& other) {
+    if (ptr) {
+      ptr->getAlreadyLockedExclusive()++;
+    }
+    ptr = other.ptr;
+    other.ptr = nullptr;
+    if (ptr) {
+      ptr->getAlreadyLockedExclusive()++;
+    }
+    return *this;
+  }
+  ~OnlyTouchUnderLock() noexcept(false) {
+    if (ptr != nullptr) {
+      ptr->getAlreadyLockedExclusive()++;
+    }
+  }
+
+  void frob() {
+    ptr->getAlreadyLockedExclusive()++;
+  }
+
+private:
+  MutexGuarded<uint>* ptr;
+};
+
+KJ_TEST("ExternalMutexGuarded<T> destroy after release") {
+  MutexGuarded<uint> guarded(0);
+
+  {
+    ExternalMutexGuarded<OnlyTouchUnderLock> ext;
+
+    {
+      auto lock = guarded.lockExclusive();
+      ext.set(lock, guarded);
+      KJ_EXPECT(*lock == 2);
+      ext.get(lock).frob();
+      KJ_EXPECT(*lock == 3);
+    }
+
+    {
+      auto lock = guarded.lockExclusive();
+      auto released = ext.release(lock);
+      KJ_EXPECT(*lock == 4);
+      released.frob();
+      KJ_EXPECT(*lock == 5);
+    }
+  }
+
+  {
+    auto lock = guarded.lockExclusive();
+    KJ_EXPECT(*lock == 6);
+  }
+}
+
+KJ_TEST("ExternalMutexGuarded<T> destroy without release") {
+  MutexGuarded<uint> guarded(0);
+
+  {
+    ExternalMutexGuarded<OnlyTouchUnderLock> ext;
+
+    {
+      auto lock = guarded.lockExclusive();
+      ext.set(lock, guarded);
+      KJ_EXPECT(*lock == 2);
+      ext.get(lock).frob();
+      KJ_EXPECT(*lock == 3);
+    }
+  }
+
+  {
+    auto lock = guarded.lockExclusive();
+    KJ_EXPECT(*lock == 4);
+  }
+}
+
 }  // namespace
 }  // namespace kj
