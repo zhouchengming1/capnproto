@@ -3961,13 +3961,13 @@ public:
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
     if (concurrentRequests < maxConcurrentRequests) {
-      auto counter = kj::heap<ConnectionCounter>(*this);
+      auto counter = ConnectionCounter(*this);
       auto request = inner.request(method, url, headers, expectedBodySize);
       auto promise = attachCounter(kj::mv(request.response), kj::mv(counter));
       return { kj::mv(request.body), kj::mv(promise) };
     }
 
-    auto paf = kj::newPromiseAndFulfiller<kj::Own<ConnectionCounter>>();
+    auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
     auto urlCopy = kj::str(url);
     auto headersCopy = headers.clone();
     // TODO(now): Use PromiseOutputStream instead
@@ -3979,7 +3979,7 @@ public:
                urlCopy = kj::mv(urlCopy),
                headersCopy = kj::mv(headersCopy),
                expectedBodySize,
-               pipeIn = kj::mv(pipe.in)](kj::Own<ConnectionCounter>&& counter) mutable {
+               pipeIn = kj::mv(pipe.in)](ConnectionCounter&& counter) mutable {
       auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
       return pipeIn->pumpTo(*request.body).ignoreResult().attach(kj::mv(request.body))
           .then([response = kj::mv(request.response),
@@ -3995,18 +3995,18 @@ public:
   kj::Promise<WebSocketResponse> openWebSocket(
       kj::StringPtr url, const kj::HttpHeaders& headers) override {
     if (concurrentRequests < maxConcurrentRequests) {
-      auto counter = kj::heap<ConnectionCounter>(*this);
+      auto counter = ConnectionCounter(*this);
       return attachCounter(inner.openWebSocket(url, headers), kj::mv(counter));
     }
 
-    auto paf = kj::newPromiseAndFulfiller<kj::Own<ConnectionCounter>>();
+    auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
     auto urlCopy = kj::str(url);
     auto headersCopy = headers.clone();
 
     auto promise = paf.promise
         .then([this,
                urlCopy = kj::mv(urlCopy),
-               headersCopy = kj::mv(headersCopy)](kj::Own<ConnectionCounter>&& counter) mutable {
+               headersCopy = kj::mv(headersCopy)](ConnectionCounter&& counter) mutable {
       return attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
     });
 
@@ -4021,19 +4021,32 @@ private:
   uint maxConcurrentRequests;
   uint concurrentRequests = 0;
 
-  std::queue<kj::Own<kj::PromiseFulfiller<kj::Own<ConnectionCounter>>>> pendingRequests;
+  std::queue<kj::Own<kj::PromiseFulfiller<ConnectionCounter>>> pendingRequests;
   // TODO(someday): want maximum cap on queue size?
 
   struct ConnectionCounter final {
-    ConnectionCounter(ConcurrencyLimitingHttpClient& parent)
-        : parent(parent) {
-      ++parent.concurrentRequests;
+    ConnectionCounter(ConcurrencyLimitingHttpClient& client) : parent(&client) {
+      ++parent->concurrentRequests;
     }
+    KJ_DISALLOW_COPY(ConnectionCounter);
     ~ConnectionCounter() noexcept(false) {
-      --parent.concurrentRequests;
-      parent.serviceQueue();
+      if (parent != nullptr) {
+        --parent->concurrentRequests;
+        parent->serviceQueue();
+      }
     }
-    ConcurrencyLimitingHttpClient& parent;
+    ConnectionCounter(ConnectionCounter&& other) : parent(other.parent) {
+      other.parent = nullptr;
+    }
+    ConnectionCounter& operator=(ConnectionCounter&& other) {
+      if (this != &other) {
+        this->parent = other.parent;
+        other.parent = nullptr;
+      }
+      return *this;
+    }
+
+    ConcurrencyLimitingHttpClient* parent;
   };
 
   void serviceQueue() {
@@ -4042,12 +4055,12 @@ private:
 
     auto fulfiller = kj::mv(pendingRequests.front());
     pendingRequests.pop();
-    fulfiller->fulfill(kj::heap<ConnectionCounter>(*this));
+    fulfiller->fulfill(ConnectionCounter(*this));
   }
 
   using WebSocketOrBody = kj::OneOf<kj::Own<kj::AsyncInputStream>, kj::Own<WebSocket>>;
   static WebSocketOrBody attachCounter(WebSocketOrBody&& webSocketOrBody,
-                                       kj::Own<ConnectionCounter>&& counter) {
+                                       ConnectionCounter&& counter) {
     KJ_SWITCH_ONEOF(webSocketOrBody) {
       KJ_CASE_ONEOF(ws, kj::Own<WebSocket>) {
         return ws.attach(kj::mv(counter));
@@ -4060,7 +4073,7 @@ private:
   }
 
   static kj::Promise<WebSocketResponse> attachCounter(kj::Promise<WebSocketResponse>&& promise,
-                                                      kj::Own<ConnectionCounter>&& counter) {
+                                                      ConnectionCounter&& counter) {
     return promise.then([counter = kj::mv(counter)](WebSocketResponse&& response) mutable {
       return WebSocketResponse {
         response.statusCode,
@@ -4072,7 +4085,7 @@ private:
   }
 
   static kj::Promise<Response> attachCounter(kj::Promise<Response>&& promise,
-                                             kj::Own<ConnectionCounter>&& counter) {
+                                             ConnectionCounter&& counter) {
     return promise.then([counter = kj::mv(counter)](Response&& response) mutable {
       return Response {
         response.statusCode,
