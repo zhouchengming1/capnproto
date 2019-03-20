@@ -3980,13 +3980,13 @@ public:
                headersCopy = kj::mv(headersCopy),
                expectedBodySize,
                pipeIn = kj::mv(pipe.in)](kj::Own<ConnectionCounter>&& counter) mutable {
-          auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
-          return pipeIn->pumpTo(*request.body).ignoreResult().attach(kj::mv(request.body))
-              .then([response = kj::mv(request.response),
-                     counter = kj::mv(counter)]() mutable {
-                return attachCounter(kj::mv(response), kj::mv(counter));
-              });
-        });
+      auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
+      return pipeIn->pumpTo(*request.body).ignoreResult().attach(kj::mv(request.body))
+          .then([response = kj::mv(request.response),
+                 counter = kj::mv(counter)]() mutable {
+        return attachCounter(kj::mv(response), kj::mv(counter));
+      });
+    });
 
     pendingRequests.push(kj::mv(paf.fulfiller));
     return { kj::mv(pipe.out), kj::mv(promise) };
@@ -4007,8 +4007,8 @@ public:
         .then([this,
                urlCopy = kj::mv(urlCopy),
                headersCopy = kj::mv(headersCopy)](kj::Own<ConnectionCounter>&& counter) mutable {
-          return attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
-        });
+      return attachCounter(inner.openWebSocket(urlCopy, headersCopy), kj::mv(counter));
+    });
 
     pendingRequests.push(kj::mv(paf.fulfiller));
     return kj::mv(promise);
