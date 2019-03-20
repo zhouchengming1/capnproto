@@ -3970,8 +3970,8 @@ public:
     auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
     auto urlCopy = kj::str(url);
     auto headersCopy = headers.clone();
-    // TODO(now): Use PromiseOutputStream instead
-    auto pipe = newOneWayPipe(expectedBodySize);
+    auto outPaf = kj::newPromiseAndFulfiller<kj::Own<AsyncOutputStream>>();
+    auto outStream = kj::heap<PromiseOutputStream>(kj::mv(outPaf.promise));
 
     auto promise = paf.promise
         .then([this,
@@ -3979,17 +3979,14 @@ public:
                urlCopy = kj::mv(urlCopy),
                headersCopy = kj::mv(headersCopy),
                expectedBodySize,
-               pipeIn = kj::mv(pipe.in)](ConnectionCounter&& counter) mutable {
+               outFulfiller = kj::mv(outPaf.fulfiller)](ConnectionCounter&& counter) mutable {
       auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
-      return pipeIn->pumpTo(*request.body).ignoreResult().attach(kj::mv(request.body))
-          .then([response = kj::mv(request.response),
-                 counter = kj::mv(counter)]() mutable {
-        return attachCounter(kj::mv(response), kj::mv(counter));
-      });
+      outFulfiller->fulfill(kj::mv(request.body));
+      return attachCounter(kj::mv(request.response), kj::mv(counter));
     });
 
     pendingRequests.push(kj::mv(paf.fulfiller));
-    return { kj::mv(pipe.out), kj::mv(promise) };
+    return { kj::mv(outStream), kj::mv(promise) };
   }
 
   kj::Promise<WebSocketResponse> openWebSocket(
