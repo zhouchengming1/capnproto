@@ -3176,6 +3176,23 @@ KJ_TEST("HttpClient concurrency limiting") {
   KJ_EXPECT(count == 0);
   KJ_EXPECT(cumulative == 2);
 
+  // Using body stream after releasing blocked response promise throws no exception
+  auto req3 = doRequest();
+  {
+    kj::Own<kj::AsyncOutputStream> req4Body;
+    {
+      auto req4 = client->request(HttpMethod::GET, kj::str("/", ++i), HttpHeaders(headerTable));
+      io.waitScope.poll();
+      req4Body = kj::mv(req4.body);
+    }
+    auto writePromise = req4Body->write("a", 1);
+    KJ_EXPECT(!writePromise.poll(io.waitScope));
+  }
+  req3.wait(io.waitScope);
+  //io.waitScope.poll();
+  KJ_EXPECT(count == 0);
+  KJ_EXPECT(cumulative == 3);
+
   // Similar connection limiting for web sockets
 #if __linux__
   // TODO(someday): Figure out why the sequencing of websockets events does
@@ -3188,7 +3205,7 @@ KJ_TEST("HttpClient concurrency limiting") {
   KJ_EXPECT(ws1->poll(io.waitScope));
   KJ_EXPECT(!ws2->poll(io.waitScope));
   KJ_EXPECT(count == 1);
-  KJ_EXPECT(cumulative == 3);
+  KJ_EXPECT(cumulative == 4);
 
   {
     auto response1 = ws1->wait(io.waitScope);
@@ -3196,12 +3213,12 @@ KJ_TEST("HttpClient concurrency limiting") {
   }
   KJ_EXPECT(ws2->poll(io.waitScope));
   KJ_EXPECT(count == 1);
-  KJ_EXPECT(cumulative == 4);
+  KJ_EXPECT(cumulative == 5);
   {
     auto response2 = ws2->wait(io.waitScope);
   }
   KJ_EXPECT(count == 0);
-  KJ_EXPECT(cumulative == 4);
+  KJ_EXPECT(cumulative == 5);
 #endif
 }
 
