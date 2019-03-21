@@ -3970,23 +3970,19 @@ public:
     auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
     auto urlCopy = kj::str(url);
     auto headersCopy = headers.clone();
-    auto outPaf = kj::newPromiseAndFulfiller<kj::Own<AsyncOutputStream>>();
-    auto outStream = kj::heap<PromiseOutputStream>(kj::mv(outPaf.promise));
 
-    auto promise = paf.promise
+    auto combined = paf.promise
         .then([this,
                method,
                urlCopy = kj::mv(urlCopy),
                headersCopy = kj::mv(headersCopy),
-               expectedBodySize,
-               outFulfiller = kj::mv(outPaf.fulfiller)](ConnectionCounter&& counter) mutable {
-      auto request = inner.request(method, urlCopy, headersCopy, expectedBodySize);
-      outFulfiller->fulfill(kj::mv(request.body));
-      return attachCounter(kj::mv(request.response), kj::mv(counter));
+               expectedBodySize](ConnectionCounter&& counter) mutable {
+      auto req = inner.request(method, urlCopy, headersCopy, expectedBodySize);
+      return kj::tuple(kj::mv(req.body), attachCounter(kj::mv(req.response), kj::mv(counter)));
     });
-
+    auto split = combined.split();
     pendingRequests.push(kj::mv(paf.fulfiller));
-    return { kj::mv(outStream), kj::mv(promise) };
+    return { kj::heap<PromiseOutputStream>(kj::mv(kj::get<0>(split))), kj::mv(kj::get<1>(split)) };
   }
 
   kj::Promise<WebSocketResponse> openWebSocket(
