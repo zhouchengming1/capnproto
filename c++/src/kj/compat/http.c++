@@ -3954,15 +3954,19 @@ namespace {
 
 class ConcurrencyLimitingHttpClient final: public HttpClient {
 public:
-  ConcurrencyLimitingHttpClient(kj::HttpClient& inner, uint maxConcurrentRequests)
+  ConcurrencyLimitingHttpClient(
+      kj::HttpClient& inner, uint maxConcurrentRequests,
+      kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback)
       : inner(inner),
-        maxConcurrentRequests(maxConcurrentRequests) {}
+        maxConcurrentRequests(maxConcurrentRequests),
+        countChangedCallback(kj::mv(countChangedCallback)) {}
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
     if (concurrentRequests < maxConcurrentRequests) {
       auto counter = ConnectionCounter(*this);
       auto request = inner.request(method, url, headers, expectedBodySize);
+      fireCountChanged();
       auto promise = attachCounter(kj::mv(request.response), kj::mv(counter));
       return { kj::mv(request.body), kj::mv(promise) };
     }
@@ -3982,6 +3986,7 @@ public:
     });
     auto split = combined.split();
     pendingRequests.push(kj::mv(paf.fulfiller));
+    fireCountChanged();
     return { kj::heap<PromiseOutputStream>(kj::mv(kj::get<0>(split))), kj::mv(kj::get<1>(split)) };
   }
 
@@ -3989,7 +3994,9 @@ public:
       kj::StringPtr url, const kj::HttpHeaders& headers) override {
     if (concurrentRequests < maxConcurrentRequests) {
       auto counter = ConnectionCounter(*this);
-      return attachCounter(inner.openWebSocket(url, headers), kj::mv(counter));
+      auto response = inner.openWebSocket(url, headers);
+      fireCountChanged();
+      return attachCounter(kj::mv(response), kj::mv(counter));
     }
 
     auto paf = kj::newPromiseAndFulfiller<ConnectionCounter>();
@@ -4004,6 +4011,7 @@ public:
     });
 
     pendingRequests.push(kj::mv(paf.fulfiller));
+    fireCountChanged();
     return kj::mv(promise);
   }
 
@@ -4013,6 +4021,7 @@ private:
   kj::HttpClient& inner;
   uint maxConcurrentRequests;
   uint concurrentRequests = 0;
+  kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback;
 
   std::queue<kj::Own<kj::PromiseFulfiller<ConnectionCounter>>> pendingRequests;
   // TODO(someday): want maximum cap on queue size?
@@ -4026,6 +4035,7 @@ private:
       if (parent != nullptr) {
         --parent->concurrentRequests;
         parent->serviceQueue();
+        parent->fireCountChanged();
       }
     }
     ConnectionCounter(ConnectionCounter&& other) : parent(other.parent) {
@@ -4049,6 +4059,10 @@ private:
     auto fulfiller = kj::mv(pendingRequests.front());
     pendingRequests.pop();
     fulfiller->fulfill(ConnectionCounter(*this));
+  }
+
+  void fireCountChanged() {
+    countChangedCallback(concurrentRequests, pendingRequests.size());
   }
 
   using WebSocketOrBody = kj::OneOf<kj::Own<kj::AsyncInputStream>, kj::Own<WebSocket>>;
@@ -4092,9 +4106,11 @@ private:
 
 }
 
-kj::Own<HttpClient> newConcurrencyLimitingHttpClient(HttpClient& inner,
-                                                     uint maxConcurrentRequests) {
-  return kj::heap<ConcurrencyLimitingHttpClient>(inner, maxConcurrentRequests);
+kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
+    HttpClient& inner, uint maxConcurrentRequests,
+    kj::Function<void(uint runningCount, uint pendingCount)> countChangedCallback) {
+  return kj::heap<ConcurrencyLimitingHttpClient>(inner, maxConcurrentRequests,
+      kj::mv(countChangedCallback));
 }
 
 // =======================================================================================

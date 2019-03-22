@@ -3137,7 +3137,24 @@ KJ_TEST("HttpClient concurrency limiting") {
   clientSettings.entropySource = entropySource;
   clientSettings.idleTimout = 0 * kj::SECONDS;
   auto innerClient = newHttpClient(clientTimer, headerTable, countingAddr, clientSettings);
-  auto client = newConcurrencyLimitingHttpClient(*innerClient, 1);
+
+  struct CallbackEvent {
+    uint runningCount;
+    uint pendingCount;
+
+    bool operator==(const CallbackEvent& other) const {
+      return runningCount == other.runningCount && pendingCount == other.pendingCount;
+    }
+    bool operator!=(const CallbackEvent& other) const { return !(*this == other); }
+    // TODO(someday): Can use default spaceship operator in C++20:
+    //auto operator<=>(const CallbackEvent&) const = default;
+  };
+
+  kj::Vector<CallbackEvent> callbackEvents;
+  auto callback = [&](uint runningCount, uint pendingCount) {
+    callbackEvents.add(CallbackEvent{runningCount, pendingCount});
+  };
+  auto client = newConcurrencyLimitingHttpClient(*innerClient, 1, kj::mv(callback));
 
   KJ_EXPECT(count == 0);
   KJ_EXPECT(cumulative == 0);
@@ -3156,6 +3173,10 @@ KJ_TEST("HttpClient concurrency limiting") {
 
   // Second connection blocked by first.
   auto req1 = doRequest();
+
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 0} }));
+  callbackEvents.clear();
+
   auto req2 = doRequest();
 
   // TODO(someday): Figure out why this poll() is necessary on Windows and macOS.
@@ -3165,16 +3186,22 @@ KJ_TEST("HttpClient concurrency limiting") {
   KJ_EXPECT(!req2.poll(io.waitScope));
   KJ_EXPECT(count == 1);
   KJ_EXPECT(cumulative == 1);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 1} }));
+  callbackEvents.clear();
 
   // Releasing first connection allows second to start.
   req1.wait(io.waitScope);
   KJ_EXPECT(req2.poll(io.waitScope));
   KJ_EXPECT(count == 1);
   KJ_EXPECT(cumulative == 2);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 0} }));
+  callbackEvents.clear();
 
   req2.wait(io.waitScope);
   KJ_EXPECT(count == 0);
   KJ_EXPECT(cumulative == 2);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {0, 0} }));
+  callbackEvents.clear();
 
   // Using body stream after releasing blocked response promise throws no exception
   auto req3 = doRequest();
@@ -3189,7 +3216,6 @@ KJ_TEST("HttpClient concurrency limiting") {
     KJ_EXPECT(!writePromise.poll(io.waitScope));
   }
   req3.wait(io.waitScope);
-  //io.waitScope.poll();
   KJ_EXPECT(count == 0);
   KJ_EXPECT(cumulative == 3);
 
@@ -3200,25 +3226,35 @@ KJ_TEST("HttpClient concurrency limiting") {
   // simple as inserting poll()s as above, since doing so puts the websocket in
   // a state that trips a "previous HTTP message body incomplete" assertion,
   // while trying to write 500 network response.
+  callbackEvents.clear();
   auto ws1 = kj::heap(client->openWebSocket(kj::str("/websocket"), HttpHeaders(headerTable)));
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 0} }));
+  callbackEvents.clear();
   auto ws2 = kj::heap(client->openWebSocket(kj::str("/websocket"), HttpHeaders(headerTable)));
   KJ_EXPECT(ws1->poll(io.waitScope));
   KJ_EXPECT(!ws2->poll(io.waitScope));
   KJ_EXPECT(count == 1);
   KJ_EXPECT(cumulative == 4);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 1} }));
+  callbackEvents.clear();
 
   {
     auto response1 = ws1->wait(io.waitScope);
     KJ_EXPECT(!ws2->poll(io.waitScope));
+    KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({}));
   }
   KJ_EXPECT(ws2->poll(io.waitScope));
   KJ_EXPECT(count == 1);
   KJ_EXPECT(cumulative == 5);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {1, 0} }));
+  callbackEvents.clear();
   {
     auto response2 = ws2->wait(io.waitScope);
+    KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({}));
   }
   KJ_EXPECT(count == 0);
   KJ_EXPECT(cumulative == 5);
+  KJ_EXPECT(callbackEvents == kj::ArrayPtr<const CallbackEvent>({ {0, 0} }));
 #endif
 }
 
